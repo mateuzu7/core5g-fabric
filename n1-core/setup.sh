@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # n1-core/setup.sh — VM "Core" (N1): Kubernetes (minikube) + free5GC via Helm
 #
@@ -19,7 +18,10 @@ set -euo pipefail
 
 MASTER_IF="${MASTER_IF:-}"
 INSTALL_MONITORING="${INSTALL_MONITORING:-0}"
-GTP5G_TAG="v0.8.1"
+# v0.8.1 (do tutorial original) não compila em kernels >= 6.2 (falta suporte
+# à API de netlink genérica nova). v0.8.5+ corrige isso; usamos a mais
+# recente estável para máxima compatibilidade com kernels novos do FABRIC.
+GTP5G_TAG="${GTP5G_TAG:-v0.10.2}"
 
 log() { echo -e "\n[n1-core] $*"; }
 
@@ -34,10 +36,16 @@ sudo apt install -y curl wget apt-transport-https gcc make git
 
 # ---------------------------------------------------------------------------
 log "Instalando módulo de kernel gtp5g (${GTP5G_TAG})..."
-if [ ! -d "$HOME/gtp5g" ]; then
-  git clone -b "$GTP5G_TAG" https://github.com/free5gc/gtp5g.git "$HOME/gtp5g"
+if [ -d "$HOME/gtp5g" ]; then
+  CURRENT_TAG="$(git -C "$HOME/gtp5g" describe --tags 2>/dev/null || echo '?')"
+  if [ "$CURRENT_TAG" != "$GTP5G_TAG" ]; then
+    log "Diretório ~/gtp5g existe com tag diferente (${CURRENT_TAG}) — refazendo clone limpo."
+    rm -rf "$HOME/gtp5g"
+  fi
 fi
+[ -d "$HOME/gtp5g" ] || git clone -b "$GTP5G_TAG" https://github.com/free5gc/gtp5g.git "$HOME/gtp5g"
 cd "$HOME/gtp5g"
+make clean 2>/dev/null || true
 make
 sudo make install
 
