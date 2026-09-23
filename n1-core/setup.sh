@@ -1,170 +1,217 @@
-#!/usr/bin/env bash
-# n1-core/setup.sh — VM "Core" (N1): Kubernetes (minikube) + free5GC via Helm
-#
-# Baseado no tutorial "Introduza o Kubernetes e implante o free5GC no
-# Kubernetes com o helm" (free5GC.org) e em
-# https://github.com/Orange-OpenSource/towards5gs-helm
-#
-# Diferença em relação ao tutorial original: aqui só é instalado o chart do
-# free5GC. O UERANSIM roda fora, nas VMs N2/N3, então o chart 'ueransim' do
-# towards5gs-helm NÃO é instalado (evita gNB/UE duplicados dentro do cluster).
-#
-# Uso:
-#   ./setup.sh
-#   INSTALL_MONITORING=1 ./setup.sh     # também sobe Prometheus/Grafana
-#   MASTER_IF=eth0 ./setup.sh           # força a interface (senão detecta sozinho)
-#
-set -euo pipefail
+```bash
+#!/bin/bash
 
-MASTER_IF="${MASTER_IF:-}"
-INSTALL_MONITORING="${INSTALL_MONITORING:-0}"
-# v0.8.1 (do tutorial original) não compila em kernels >= 6.2 (falta suporte
-# à API de netlink genérica nova). v0.8.5+ corrige isso; usamos a mais
-# recente estável para máxima compatibilidade com kernels novos do FABRIC.
-GTP5G_TAG="${GTP5G_TAG:-v0.10.2}"
+set -e
 
-log() { echo -e "\n[n1-core] $*"; }
+echo "=========================================="
+echo "  Setup N1 - free5GC + Kubernetes"
+echo "=========================================="
 
-# ---------------------------------------------------------------------------
-log "Checando versão do kernel (UPF/gtp5g precisa de 5.0.0-23 genérico ou 5.4.x)..."
-uname -r || true
+# ------------------------------------------
+# 1. Atualizar sistema
+# ------------------------------------------
 
-log "Atualizando pacotes..."
-sudo apt update -y
+echo "[1/10] Atualizando sistema..."
+
+sudo apt update
 sudo apt upgrade -y
-sudo apt install -y curl wget apt-transport-https gcc make git
 
-# ---------------------------------------------------------------------------
-log "Instalando módulo de kernel gtp5g (${GTP5G_TAG})..."
-if [ -d "$HOME/gtp5g" ]; then
-  CURRENT_TAG="$(git -C "$HOME/gtp5g" describe --tags 2>/dev/null || echo '?')"
-  if [ "$CURRENT_TAG" != "$GTP5G_TAG" ]; then
-    log "Diretório ~/gtp5g existe com tag diferente (${CURRENT_TAG}) — refazendo clone limpo."
-    rm -rf "$HOME/gtp5g"
-  fi
+# ------------------------------------------
+# 2. Dependências básicas
+# ------------------------------------------
+
+echo "[2/10] Instalando dependências..."
+
+sudo apt install -y \
+    git \
+    curl \
+    wget \
+    vim \
+    net-tools \
+    iproute2 \
+    build-essential \
+    linux-headers-$(uname -r) \
+    ca-certificates \
+    gnupg \
+    lsb-release
+
+# ------------------------------------------
+# 3. Docker
+# ------------------------------------------
+
+echo "[3/10] Instalando Docker..."
+
+if ! command -v docker >/dev/null 2>&1; then
+    sudo apt install -y docker.io
 fi
-[ -d "$HOME/gtp5g" ] || git clone -b "$GTP5G_TAG" https://github.com/free5gc/gtp5g.git "$HOME/gtp5g"
+
+sudo systemctl enable docker
+sudo systemctl start docker
+
+sudo usermod -aG docker "$USER" || true
+
+echo "Docker instalado:"
+sudo docker --version
+
+# ------------------------------------------
+# 4. kubectl
+# ------------------------------------------
+
+echo "[4/10] Instalando kubectl..."
+
+if ! command -v kubectl >/dev/null 2>&1; then
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+    sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+    rm -f kubectl
+fi
+
+kubectl version --client
+
+# ------------------------------------------
+# 5. Minikube
+# ------------------------------------------
+
+echo "[5/10] Instalando Minikube..."
+
+if ! command -v minikube >/dev/null 2>&1; then
+    curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+
+    sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+    rm -f minikube-linux-amd64
+fi
+
+minikube version
+
+# ------------------------------------------
+# 6. Helm
+# ------------------------------------------
+
+echo "[6/10] Instalando Helm..."
+
+if ! command -v helm >/dev/null 2>&1; then
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+helm version
+
+# ------------------------------------------
+# 7. gtp5g
+# ------------------------------------------
+
+echo "[7/10] Instalando gtp5g..."
+
+if [ ! -d "$HOME/gtp5g" ]; then
+    git clone https://github.com/free5gc/gtp5g.git "$HOME/gtp5g"
+fi
+
 cd "$HOME/gtp5g"
-make clean 2>/dev/null || true
+
+# Versão compatível com free5GC v3.3.0
+git fetch --tags
+git checkout v0.8.10
+
+make clean || true
 make
 sudo make install
 
-# ---------------------------------------------------------------------------
-log "Instalando Docker..."
-for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
-  sudo apt-get remove -y "$pkg" 2>/dev/null || true
-done
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-fi
-sudo chmod a+r /etc/apt/keyrings/docker.gpg
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker "$USER"
+sudo modprobe gtp5g
 
-# ---------------------------------------------------------------------------
-log "Instalando minikube..."
-if ! command -v minikube &>/dev/null; then
-  cd "$HOME"
-  wget -q https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
-  sudo cp minikube-linux-amd64 /usr/local/bin/minikube
-  sudo chmod +x /usr/local/bin/minikube
+echo "gtp5g:"
+lsmod | grep gtp5g || true
+
+# ------------------------------------------
+# 8. Multus CNI
+# ------------------------------------------
+
+echo "[8/10] Preparando Kubernetes/Multus..."
+
+# Iniciar Minikube usando Docker
+if ! minikube status >/dev/null 2>&1; then
+    minikube start \
+        --driver=docker \
+        --cpus=4 \
+        --memory=12000
 fi
 
-log "Instalando kubectl..."
-if ! command -v kubectl &>/dev/null; then
-  cd "$HOME"
-  KUBECTL_VER="$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)"
-  curl -LO "https://storage.googleapis.com/kubernetes-release/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
-  chmod +x kubectl
-  sudo mv kubectl /usr/local/bin/
+# Garantir contexto correto
+unset KUBECONFIG
+
+kubectl config use-context minikube
+
+echo "Kubernetes:"
+kubectl get nodes
+
+# Instalar Multus
+kubectl apply -f \
+    https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset-thick.yml
+
+echo "Aguardando Multus..."
+
+kubectl -n kube-system rollout status \
+    daemonset/kube-multus-ds \
+    --timeout=180s || true
+
+# ------------------------------------------
+# 9. Repositório Helm do free5GC
+# ------------------------------------------
+
+echo "[9/10] Preparando Helm..."
+
+helm repo add towards5gs \
+    https://orange-opensource.github.io/towards5gs-helm/
+
+helm repo update
+
+# ------------------------------------------
+# 10. Diretório do free5GC
+# ------------------------------------------
+
+echo "[10/10] Preparando free5GC..."
+
+cd "$HOME"
+
+if [ ! -d "$HOME/free5gc" ]; then
+    helm pull towards5gs/free5gc --untar
 fi
 
-log "Instalando Helm..."
-if ! command -v helm &>/dev/null; then
-  cd "$HOME"
-  curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
-  chmod 700 get_helm.sh
-  ./get_helm.sh
-fi
-
-log "Clonando multus-cni..."
-if [ ! -d "$HOME/multus-cni" ]; then
-  git clone https://github.com/k8snetworkplumbingwg/multus-cni.git "$HOME/multus-cni"
-fi
-
-# ---------------------------------------------------------------------------
-log "Subindo minikube com driver docker + CNI flannel (via grupo docker, sem precisar relogar)..."
-sg docker -c "minikube start --driver=docker --cpus=4 --memory=8g --disk-size=20g --cni=flannel"
-sg docker -c "minikube status" || log "AVISO: 'minikube status' fora do grupo docker pode acusar permission denied — isso é só do comando de status em si, não do cluster. Rode 'newgrp docker' numa sessão nova pra conferir sem o wrapper."
-
-log "Aplicando Multus-CNI..."
-cd "$HOME/multus-cni"
-cat ./deployments/multus-daemonset.yml | kubectl apply -f -
-
-# ---------------------------------------------------------------------------
-if [ -z "$MASTER_IF" ]; then
-  MASTER_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
-  log "MASTER_IF não informado — detectado automaticamente: ${MASTER_IF:-<não encontrado>}"
-fi
-if [ -z "$MASTER_IF" ]; then
-  log "AVISO: não consegui detectar a interface de rede. Defina MASTER_IF manualmente e rode de novo,"
-  log "ou ajuste os valores abaixo direto no comando helm install."
-fi
-
-log "Clonando towards5gs-helm e instalando o free5GC (sem o chart ueransim)..."
-# A imagem bitnami/mongodb:4.4.4-debian-10-r0 (default do chart) foi removida
-# do Docker Hub em 2025 — a Bitnami mudou tags antigas pro repo bitnamilegacy.
-# Por isso apontamos explicitamente pra lá abaixo.
-kubectl create ns free5gc 2>/dev/null || log "namespace free5gc já existe"
-if [ ! -d "$HOME/towards5gs-helm" ]; then
-  git clone https://github.com/Orange-OpenSource/towards5gs-helm.git "$HOME/towards5gs-helm"
-fi
-cd "$HOME/towards5gs-helm/charts/"
-
-helm -n free5gc install free5gc-v1 ./free5gc/ \
-  --set global.n2network.masterIf="${MASTER_IF}" \
-  --set global.n3network.masterIf="${MASTER_IF}" \
-  --set global.n4network.masterIf="${MASTER_IF}" \
-  --set global.n6network.masterIf="${MASTER_IF}" \
-  --set global.n9network.masterIf="${MASTER_IF}" \
-  --set mongodb.image.repository=bitnamilegacy/mongodb \
-  --set mongodb.image.tag=4.4.15
-
-log "Aguardando pods do free5gc subirem (Ctrl+C p/ sair do watch quando estiver tudo Running)..."
-watch kubectl get pods -n free5gc || true
-
-# ---------------------------------------------------------------------------
-if [ "$INSTALL_MONITORING" = "1" ]; then
-  log "Instalando Prometheus + Grafana (kube-prometheus-stack)..."
-  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  helm repo update
-  kubectl create namespace prometheus 2>/dev/null || log "namespace prometheus já existe"
-  helm install prometheus prometheus-community/kube-prometheus-stack -n prometheus
-  log "Grafana: kubectl port-forward -n prometheus svc/prometheus-grafana 8080:80 (login admin / prom-operator)"
-fi
-
-# ---------------------------------------------------------------------------
-cat <<EOF
-
-[n1-core] Setup concluído.
-
-WebConsole do free5GC (login admin / free5gc):
-  kubectl port-forward --namespace free5gc svc/webui-service 5000:5000
-  # de fora da VM: ssh -L localhost:5000:localhost:5000 ubuntu@<IP da N1 no FABRIC>
-
-Cadastre no WebConsole os SUPIs que você configurou nos UEs do N2/N3
-(imsi-208930000000002 e imsi-208930000000003, se você usou os valores
-padrão dos scripts n2-ueransim/setup.sh e n3-client/setup.sh).
-
-Lembrete: essa VM expira em 24h no FABRIC — depois que confirmar que
-'kubectl get pods -n free5gc' está tudo Running, considere salvar uma
-imagem/snapshot da VM (se o FABRIC permitir) pra não repetir esse setup.
-EOF
+echo ""
+echo "=========================================="
+echo " Setup concluído!"
+echo "=========================================="
+echo ""
+echo "Docker:"
+sudo docker --version
+echo ""
+echo "kubectl:"
+kubectl version --client
+echo ""
+echo "Minikube:"
+minikube version
+echo ""
+echo "Helm:"
+helm version
+echo ""
+echo "gtp5g:"
+lsmod | grep gtp5g || echo "Módulo gtp5g não carregado"
+echo ""
+echo "Kubernetes:"
+kubectl get nodes
+echo ""
+echo "free5GC:"
+ls -ld "$HOME/free5gc" 2>/dev/null || true
+echo ""
+echo "IMPORTANTE:"
+echo "Se este for o primeiro login após adicionar o usuário"
+echo "ao grupo docker, execute:"
+echo ""
+echo "    newgrp docker"
+echo ""
+echo "Depois confira:"
+echo ""
+echo "    docker ps"
+echo "    kubectl get nodes"
+echo ""
+```
