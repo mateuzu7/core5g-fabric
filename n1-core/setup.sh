@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 
 set -e
@@ -9,7 +8,7 @@ echo "   Ubuntu 22.04"
 echo "=========================================="
 
 # ============================================================
-# 0. Verificações
+# 0. Verificar Ubuntu
 # ============================================================
 
 echo
@@ -20,7 +19,7 @@ if ! grep -q "22.04" /etc/os-release; then
     exit 1
 fi
 
-echo "Ubuntu:"
+echo "Sistema:"
 lsb_release -ds
 
 echo
@@ -28,14 +27,14 @@ echo "Kernel:"
 uname -r
 
 # ============================================================
-# 1. Atualização
+# 1. Atualizar sistema
 # ============================================================
 
 echo
 echo "[1/9] Atualizando sistema..."
 
-sudo apt update
-sudo apt upgrade -y
+sudo apt-get update
+sudo apt-get upgrade -y
 
 # ============================================================
 # 2. Dependências
@@ -44,7 +43,7 @@ sudo apt upgrade -y
 echo
 echo "[2/9] Instalando dependências..."
 
-sudo apt install -y \
+sudo apt-get install -y \
     git \
     curl \
     wget \
@@ -68,7 +67,7 @@ echo
 echo "[3/9] Instalando Docker..."
 
 if ! command -v docker >/dev/null 2>&1; then
-    sudo apt install -y docker.io
+    sudo apt-get install -y docker.io
 fi
 
 sudo systemctl enable docker
@@ -77,7 +76,7 @@ sudo systemctl start docker
 sudo usermod -aG docker "$USER" || true
 
 echo
-echo "Docker instalado:"
+echo "Docker:"
 sudo docker --version
 
 # ============================================================
@@ -95,8 +94,12 @@ if ! command -v kubectl >/dev/null 2>&1; then
     curl -LO \
         "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
 
-    sudo install -o root -g root -m 0755 \
-        kubectl /usr/local/bin/kubectl
+    sudo install \
+        -o root \
+        -g root \
+        -m 0755 \
+        kubectl \
+        /usr/local/bin/kubectl
 
     rm -f kubectl
 fi
@@ -144,7 +147,7 @@ echo
 helm version
 
 # ============================================================
-# 7. gtp5g
+# 7. gtp5g v0.8.10
 # ============================================================
 
 echo
@@ -160,27 +163,39 @@ fi
 
 cd "$HOME/gtp5g"
 
+echo
+echo "Obtendo tags do gtp5g..."
+
 git fetch --tags
+
+echo
+echo "Selecionando gtp5g v0.8.10..."
 
 git checkout v0.8.10
 
 echo
-echo "gtp5g:"
+echo "Versão selecionada:"
 git describe --tags --always
 
-# Remover módulo antigo, caso exista
+# Remover módulo antigo se existir
 sudo modprobe -r gtp5g 2>/dev/null || true
 
 # Limpar compilação anterior
 make clean 2>/dev/null || true
 
-# Compilar
+echo
+echo "Compilando gtp5g..."
+
 make
 
-# Instalar
+echo
+echo "Instalando gtp5g..."
+
 sudo make install
 
-# Carregar módulo
+echo
+echo "Carregando módulo gtp5g..."
+
 sudo modprobe gtp5g
 
 echo
@@ -188,16 +203,18 @@ echo "Módulo gtp5g:"
 lsmod | grep gtp5g || true
 
 # ============================================================
-# 8. Minikube + Multus
+# 8. Kubernetes + Minikube + Multus
 # ============================================================
 
 echo
 echo "[8/9] Configurando Kubernetes..."
 
-# Garantir que o KUBECONFIG antigo não interfira
+# Evita conflito com K3s/KUBECONFIG antigo
 unset KUBECONFIG
 
-# Verificar se Minikube já está rodando
+echo
+echo "Iniciando Minikube..."
+
 if ! minikube status >/dev/null 2>&1; then
 
     minikube start \
@@ -207,16 +224,18 @@ if ! minikube status >/dev/null 2>&1; then
 
 fi
 
-# Contexto
+echo
+echo "Selecionando contexto Minikube..."
+
 kubectl config use-context minikube
 
 echo
 echo "Nós Kubernetes:"
 kubectl get nodes
 
-# ------------------------------------------------------------
-# Multus
-# ------------------------------------------------------------
+# ============================================================
+# Multus CNI
+# ============================================================
 
 echo
 echo "Instalando Multus CNI..."
@@ -231,6 +250,10 @@ kubectl -n kube-system rollout status \
     daemonset/kube-multus-ds \
     --timeout=180s || true
 
+echo
+echo "Multus:"
+kubectl get pods -n kube-system | grep -i multus || true
+
 # ============================================================
 # 9. Helm + free5GC
 # ============================================================
@@ -238,11 +261,18 @@ kubectl -n kube-system rollout status \
 echo
 echo "[9/9] Preparando free5GC..."
 
-helm repo add towards5gs \
+echo
+echo "Adicionando repositório towards5gs..."
+
+helm repo add \
+    towards5gs \
     https://orange-opensource.github.io/towards5gs-helm/ \
     2>/dev/null || true
 
 helm repo update
+
+echo
+echo "Baixando chart do free5GC..."
 
 cd "$HOME"
 
@@ -251,6 +281,10 @@ if [ ! -d "$HOME/free5gc" ]; then
     helm pull \
         towards5gs/free5gc \
         --untar
+
+else
+
+    echo "~/free5gc já existe. Pulando download."
 
 fi
 
@@ -289,7 +323,7 @@ helm version
 
 echo
 echo "gtp5g:"
-lsmod | grep gtp5g || echo "gtp5g não está carregado"
+lsmod | grep gtp5g || echo "Módulo gtp5g não carregado"
 
 echo
 echo "Kubernetes:"
@@ -298,18 +332,19 @@ kubectl get nodes
 echo
 echo "free5GC:"
 if [ -d "$HOME/free5gc" ]; then
-    echo "Diretório ~/free5gc encontrado."
+    echo "Chart ~/free5gc encontrado."
 else
-    echo "Diretório ~/free5gc NÃO encontrado."
+    echo "Chart ~/free5gc NÃO encontrado."
 fi
 
 echo
 echo "=========================================="
-echo " ATENÇÃO"
+echo "       PRÓXIMO PASSO"
 echo "=========================================="
+
 echo
-echo "Se esta for a primeira execução após adicionar"
-echo "o usuário ao grupo docker, execute:"
+echo "Se o Docker ainda exigir atualização"
+echo "da sessão do usuário, execute:"
 echo
 echo "    newgrp docker"
 echo
@@ -319,4 +354,3 @@ echo "    docker ps"
 echo "    kubectl get nodes"
 echo
 echo "=========================================="
-```
