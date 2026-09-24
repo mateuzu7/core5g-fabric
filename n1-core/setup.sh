@@ -68,7 +68,8 @@ containerd config default > /etc/containerd/config.toml
 systemctl restart containerd
 
 # ============================================================
-log "[4/11] Instalando crictl e cni-plugins (pré-requisitos do driver=none)"
+log "[4/11] Instalando crictl, cni-plugins e conntrack/socat (pré-requisitos do driver=none)"
+apt-get install -y conntrack socat
 if ! command -v crictl >/dev/null 2>&1; then
   CRICTL_VERSION="v1.32.0"
   curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" -o /tmp/crictl.tar.gz
