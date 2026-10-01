@@ -1,0 +1,885 @@
+Claro. Vou montar como um **tutorial de reprodução do ambiente que realmente funcionou para nós**, separando o que é obrigatório do que foi apenas uma tentativa que deu errado.
+
+A ideia é que seu amigo consiga seguir do zero e chegar ao mesmo ponto: **N1 com Kubernetes + OVS/Multus + MongoDB + gtp5g + free5GC + WebUI funcionando**.
+
+> **Importante:** não siga a antiga instalação via Helm que testamos anteriormente. O caminho que funcionou foi `testbed-automator` + `free5gc-k8s` + Kustomize.
+
+# Tutorial — Deploy do Free5GC no Kubernetes com FABRIC
+
+## 1. Arquitetura utilizada
+
+Nosso ambiente final está organizado assim:
+
+```text
+                    FABRIC
+                      │
+                ┌─────┴─────┐
+                │    N1     │
+                │ Kubernetes│
+                │           │
+                │ Free5GC   │
+                │ MongoDB   │
+                │ WebUI     │
+                │ gtp5g     │
+                │ OVS       │
+                └───────────┘
+                      │
+             futuramente
+          ┌───────────┴───────────┐
+          │                       │
+        N2 UERANSIM             N3 UERANSIM
+          │                       │
+         gNB                     UE
+```
+
+Por enquanto configuramos somente a **N1**.
+
+Os N2/N3/N4 serão adicionados posteriormente.
+
+---
+
+# 2. Especificações da N1
+
+A VM utilizada funcionou com:
+
+| Item       | Valor              |
+| ---------- | ------------------ |
+| Sistema    | Ubuntu 22.04.5 LTS |
+| CPU        | 4 vCPU             |
+| RAM        | ~15 GB             |
+| Disco      | ~100 GB            |
+| Kernel     | 5.15.0-185-generic |
+| Hostname   | `n1`               |
+| IP FABRIC  | `10.20.5.20`       |
+| Kubernetes | v1.28.15           |
+| containerd | 2.3.6              |
+
+O projeto `free5gc-k8s` recomenda kernel 5.4.0 e informa que também foi testado com 5.15.0-94; kernels 6.x podem causar problemas no UPF. Portanto, **não use Ubuntu/kernel 6.x para simplesmente reproduzir este ambiente**. 
+
+Nosso kernel 5.15 funcionou.
+
+---
+
+# 3. Acesso à VM da FABRIC
+
+O comando utilizado para entrar na VM foi:
+
+```bash
+ssh -i /home/mateuzu/FABRIC/fabric_config/keys/slice_key \
+-F /home/mateuzu/FABRIC/fabric_config/ssh_config \
+ubuntu@133.69.160.254
+```
+
+No caso do seu amigo, obviamente ele precisará utilizar **a própria chave e configuração SSH da FABRIC**.
+
+Depois de entrar:
+
+```bash
+hostname
+```
+
+Esperamos:
+
+```text
+n1
+```
+
+E:
+
+```bash
+uname -r
+```
+
+No nosso caso:
+
+```text
+5.15.0-185-generic
+```
+
+Verifique também a interface:
+
+```bash
+ip a
+```
+
+A interface principal ficou com:
+
+```text
+10.20.5.20/23
+```
+
+---
+
+# 4. Instalar o testbed-automator
+
+O `testbed-automator` foi utilizado para preparar automaticamente o ambiente Kubernetes.
+
+O próprio projeto indica o uso de usuário normal com `sudo`, e não root. Ele também requer acesso à Internet durante a instalação. 
+
+Na N1:
+
+```bash
+cd ~
+git clone https://github.com/niloysh/testbed-automator.git
+cd testbed-automator
+```
+
+Depois:
+
+```bash
+./install.sh
+```
+
+O script prepara a infraestrutura necessária para o testbed, incluindo Kubernetes, CNI e Open vSwitch.
+
+O projeto fornece `install.sh`, `uninstall.sh` e `cleanup.sh`; o `install.sh` é o utilizado para a configuração inicial. 
+
+### Verificar Kubernetes
+
+Depois da instalação:
+
+```bash
+kubectl get nodes -o wide
+```
+
+No nosso ambiente apareceu aproximadamente:
+
+```text
+NAME   STATUS   ROLES           VERSION
+n1     Ready    control-plane   v1.28.15
+```
+
+Também verificamos:
+
+```bash
+kubectl get pods -A
+```
+
+Os componentes do Kubernetes/CNI/OpenEBS estavam `Running`.
+
+---
+
+# 5. Verificar o Open vSwitch
+
+O `testbed-automator` também preparou as bridges OVS utilizadas pela arquitetura 5G.
+
+Verifique:
+
+```bash
+sudo ovs-vsctl show
+```
+
+Devem existir, entre outras configurações, as bridges:
+
+```text
+n2br
+n3br
+n4br
+```
+
+Essas bridges são importantes porque o `free5gc-k8s` utiliza interfaces secundárias através do Multus/OVS-CNI.
+
+Para um **cluster de um único nó**, não precisamos criar VXLAN entre nós. O próprio projeto `free5gc-k8s` informa que o `testbed-automator` configura as bridges OVS para esse cenário; VXLAN é necessário para interconexão em configurações multinó. 
+
+---
+
+# 6. Clonar o free5gc-k8s
+
+Agora:
+
+```bash
+cd ~
+git clone https://github.com/niloysh/free5gc-k8s.git
+cd ~/free5gc-k8s
+```
+
+A estrutura deve conter:
+
+```text
+free5gc-k8s/
+├── mongodb/
+├── networks5g/
+├── free5gc/
+├── free5gc-webui/
+├── free5gc-metrics/
+├── ueransim/
+├── bin/
+└── README.md
+```
+
+O projeto utiliza **Kustomize** para fazer os deployments:
+
+```bash
+kubectl apply -k <componente> -n free5gc
+```
+
+
+
+---
+
+# 7. Criar o namespace
+
+Antes dos componentes:
+
+```bash
+kubectl create namespace free5gc
+```
+
+Se ele já existir, pode aparecer:
+
+```text
+Error from server (AlreadyExists)
+```
+
+Nesse caso, não é problema.
+
+Confira:
+
+```bash
+kubectl get namespace free5gc
+```
+
+---
+
+# 8. MongoDB
+
+Primeiro:
+
+```bash
+cd ~/free5gc-k8s
+kubectl apply -k mongodb -n free5gc
+```
+
+### ⚠️ Alteração importante que tivemos que fazer
+
+O manifesto original utilizava:
+
+```text
+docker.io/bitnami/mongodb:4.4.4-debian-10-r0
+```
+
+Essa imagem não estava disponível e o pod entrou em:
+
+```text
+ImagePullBackOff
+```
+
+Também testamos a variante legacy correspondente e ela não funcionou.
+
+A solução que **funcionou no nosso ambiente** foi alterar a imagem do MongoDB para:
+
+```text
+docker.io/bitnamilegacy/mongodb:4.4.5
+```
+
+Portanto, antes de aplicar, abra:
+
+```bash
+nano ~/free5gc-k8s/mongodb/mongodb-deployment.yaml
+```
+
+e altere a linha da imagem para:
+
+```yaml
+image: docker.io/bitnamilegacy/mongodb:4.4.5
+```
+
+Depois:
+
+```bash
+kubectl apply -k mongodb -n free5gc
+```
+
+Se o pod antigo estiver preso na imagem anterior:
+
+```bash
+kubectl delete pod mongodb-0 -n free5gc
+```
+
+O StatefulSet recriará o pod.
+
+Confira:
+
+```bash
+kubectl get pods -n free5gc
+```
+
+Esperamos:
+
+```text
+mongodb-0    1/1    Running
+```
+
+Também pode verificar:
+
+```bash
+kubectl get pvc -n free5gc
+```
+
+O nosso PVC ficou `Bound` utilizando `openebs-hostpath`.
+
+---
+
+# 9. Network Attachment Definitions
+
+Agora:
+
+```bash
+cd ~/free5gc-k8s
+kubectl apply -k networks5g -n free5gc
+```
+
+Confira:
+
+```bash
+kubectl get network-attachment-definitions -n free5gc
+```
+
+Esperamos:
+
+```text
+NAME
+n2network
+n3network
+n4network
+```
+
+Essas definições são utilizadas para fornecer as interfaces de rede adicionais aos componentes do core.
+
+---
+
+# 10. Instalar o gtp5g
+
+Esse passo é **muito importante** para o UPF do Free5GC.
+
+Entre na pasta:
+
+```bash
+cd ~/free5gc-k8s/bin
+```
+
+Execute:
+
+```bash
+./install-gtp5g.sh
+```
+
+O script instala o módulo de kernel `gtp5g`.
+
+No nosso caso ele compilou corretamente para:
+
+```text
+5.15.0-185-generic
+```
+
+e instalou:
+
+```text
+/lib/modules/5.15.0-185-generic/kernel/drivers/net/gtp5g.ko
+```
+
+A versão instalada foi:
+
+```text
+0.8.2
+```
+
+Verifique:
+
+```bash
+lsmod | grep gtp5g
+```
+
+E:
+
+```bash
+modinfo gtp5g | head
+```
+
+Deve aparecer o módulo instalado.
+
+### Sobre o aviso BTF
+
+Durante a compilação apareceu:
+
+```text
+Skipping BTF generation ... due to unavailability of vmlinux
+```
+
+Isso **não impediu a instalação**. O módulo foi compilado, instalado e carregado normalmente.
+
+O próprio `free5gc-k8s` indica o `install-gtp5g.sh` como pré-requisito antes do deployment do UPF. 
+
+---
+
+# 11. Deploy do Free5GC
+
+Volte para a raiz:
+
+```bash
+cd ~/free5gc-k8s
+```
+
+Agora:
+
+```bash
+kubectl apply -k free5gc -n free5gc
+```
+
+Vai demorar um pouco.
+
+Acompanhe:
+
+```bash
+kubectl get pods -n free5gc -w
+```
+
+No final, esperamos os componentes como:
+
+```text
+free5gc-amf       1/1 Running
+free5gc-ausf      1/1 Running
+free5gc-nrf       1/1 Running
+free5gc-nssf      1/1 Running
+free5gc-pcf       1/1 Running
+free5gc-smf       1/1 Running
+free5gc-smf2      1/1 Running
+free5gc-udm       1/1 Running
+free5gc-udr       1/1 Running
+free5gc-upf       1/1 Running
+free5gc-upf2      1/1 Running
+mongodb-0         1/1 Running
+```
+
+Foi exatamente esse estado que alcançamos. 
+
+### Não avance enquanto os pods estiverem com problemas
+
+Se houver:
+
+```text
+CrashLoopBackOff
+ImagePullBackOff
+Error
+Pending
+```
+
+pare aqui e investigue.
+
+---
+
+# 12. Deploy da WebUI
+
+Com o core funcionando:
+
+```bash
+cd ~/free5gc-k8s
+kubectl apply -k free5gc-webui -n free5gc
+```
+
+Confira:
+
+```bash
+kubectl get pods -n free5gc
+```
+
+Deve aparecer:
+
+```text
+free5gc-webui-xxxxx    1/1    Running
+```
+
+Confira os serviços:
+
+```bash
+kubectl get svc -n free5gc
+```
+
+No nosso ambiente apareceu:
+
+```text
+webui-service   NodePort   ...   5000:30505/TCP
+```
+
+
+
+O README do projeto informa a WebUI normalmente como:
+
+```text
+http://<node-ip>:30505
+```
+
+com:
+
+```text
+usuário: admin
+senha: free5gc
+```
+
+
+
+---
+
+# 13. Acessar a WebUI pelo notebook
+
+Aqui tivemos uma particularidade da FABRIC.
+
+Inicialmente tentamos:
+
+```bash
+ssh -L 30505:10.20.5.20:30505 ...
+```
+
+e a página chegou a abrir, mas a própria N1 não conseguia conectar em:
+
+```text
+10.20.5.20:30505
+```
+
+O teste:
+
+```bash
+curl -I http://10.20.5.20:30505
+```
+
+retornou:
+
+```text
+Connection refused
+```
+
+
+
+Portanto, para a nossa configuração, o caminho mais confiável é usar **`kubectl port-forward` + túnel SSH**.
+
+---
+
+## 13.1 Na N1: port-forward
+
+Entre na N1 normalmente:
+
+```bash
+ssh -i /home/mateuzu/FABRIC/fabric_config/keys/slice_key \
+-F /home/mateuzu/FABRIC/fabric_config/ssh_config \
+ubuntu@133.69.160.254
+```
+
+Depois:
+
+```bash
+kubectl port-forward -n free5gc svc/webui-service 30505:5000
+```
+
+Deixe esse terminal aberto.
+
+Você deverá receber algo semelhante a:
+
+```text
+Forwarding from 127.0.0.1:30505 -> 5000
+```
+
+---
+
+## 13.2 No notebook: criar o túnel SSH
+
+Abra outro terminal **no notebook**:
+
+```bash
+ssh -L 30505:127.0.0.1:30505 \
+-i /home/mateuzu/FABRIC/fabric_config/keys/slice_key \
+-F /home/mateuzu/FABRIC/fabric_config/ssh_config \
+ubuntu@133.69.160.254
+```
+
+Deixe esse terminal aberto também.
+
+---
+
+## 13.3 Abrir no navegador
+
+No notebook:
+
+```text
+http://localhost:30505
+```
+
+Login:
+
+```text
+admin
+```
+
+Senha:
+
+```text
+free5gc
+```
+
+Esse método é equivalente ao padrão de `kubectl port-forward` documentado para a WebUI, apenas adicionando o túnel SSH porque o Kubernetes está dentro da VM da FABRIC. 
+
+---
+
+# 14. Verificação geral
+
+Quando terminar, rode:
+
+```bash
+kubectl get pods -n free5gc
+```
+
+Depois:
+
+```bash
+kubectl get svc -n free5gc
+```
+
+Depois:
+
+```bash
+kubectl get network-attachment-definitions -n free5gc
+```
+
+E:
+
+```bash
+lsmod | grep gtp5g
+```
+
+Também:
+
+```bash
+sudo ovs-vsctl show
+```
+
+O estado esperado é aproximadamente:
+
+```text
+Kubernetes
+   │
+   ├── Node n1             Ready
+   │
+   ├── MongoDB             Running
+   │
+   ├── AMF                 Running
+   ├── AUSF                Running
+   ├── NRF                 Running
+   ├── NSSF                Running
+   ├── PCF                 Running
+   ├── SMF                 Running
+   ├── SMF2                Running
+   ├── UDM                 Running
+   ├── UDR                 Running
+   ├── UPF                 Running
+   ├── UPF2                Running
+   └── WebUI               Running
+```
+
+No nosso teste final, todos esses pods estavam `1/1 Running` e sem reinicializações. 
+
+---
+
+# 15. O que ainda NÃO fizemos
+
+É importante deixar isso claro para seu amigo: **o core está instalado, mas o testbed 5G completo ainda não está concluído.**
+
+Ainda falta:
+
+### N2
+
+```text
+N2
+└── UERANSIM
+    └── gNB
+```
+
+O gNB precisa estabelecer a conexão NG com o AMF.
+
+### N3
+
+```text
+N3
+└── UERANSIM
+    └── UE
+```
+
+O UE será utilizado para registrar no core e estabelecer a PDU Session.
+
+### N4
+
+Posteriormente:
+
+```text
+N4
+└── TCPReplay
+    └── dataset 5GAD-2022
+```
+
+para os experimentos de tráfego/ataque.
+
+O próprio `free5gc-k8s` indica a ordem: primeiro gNB, depois garantir que o subscriber esteja configurado, depois iniciar os UEs e finalmente verificar conectividade/ping. 
+
+---
+
+# 16. Cadastrar o UE
+
+Quando chegarmos ao UERANSIM, vamos usar a WebUI para cadastrar o assinante.
+
+A informação do assinante precisa corresponder à configuração do UE do UERANSIM.
+
+Por exemplo, o projeto disponibiliza arquivos de configuração dos UEs dentro de:
+
+```text
+ueransim/
+```
+
+e orienta que os dados do subscriber sejam obtidos desses arquivos e inseridos na WebUI. 
+
+**Não invente IMSI, K, OPc etc.** para o cadastro: precisamos utilizar os valores correspondentes à configuração do UE que será executado.
+
+---
+
+# 17. Fluxo completo que seu amigo deve seguir
+
+Se quiser colocar isso no README do projeto, o fluxo principal pode ficar assim:
+
+```text
+1. Criar VM N1 na FABRIC
+        ↓
+2. Ubuntu 22.04
+        ↓
+3. Verificar kernel 5.15.x
+        ↓
+4. Instalar testbed-automator
+        ↓
+5. Kubernetes + Flannel + Multus + OVS
+        ↓
+6. Clonar free5gc-k8s
+        ↓
+7. Criar namespace free5gc
+        ↓
+8. Corrigir imagem do MongoDB
+        ↓
+9. Deploy MongoDB
+        ↓
+10. Deploy NetworkAttachmentDefinitions
+        ↓
+11. Instalar gtp5g
+        ↓
+12. Deploy Free5GC
+        ↓
+13. Esperar todos os pods Running
+        ↓
+14. Deploy WebUI
+        ↓
+15. kubectl port-forward
+        ↓
+16. SSH tunnel
+        ↓
+17. Acessar WebUI
+        ↓
+18. Cadastrar subscriber
+        ↓
+19. Deploy UERANSIM gNB
+        ↓
+20. Deploy UERANSIM UE
+        ↓
+21. Verificar registro do UE
+        ↓
+22. Testar PDU Session / ping
+        ↓
+23. Adicionar N4/TCPReplay
+        ↓
+24. Executar experimentos
+```
+
+---
+
+# 18. Comandos principais — versão rápida
+
+Para quem já sabe o que está fazendo, o "cheat sheet" da N1 fica:
+
+```bash
+# Testbed
+git clone https://github.com/niloysh/testbed-automator.git
+cd testbed-automator
+./install.sh
+
+# Free5GC
+cd ~
+git clone https://github.com/niloysh/free5gc-k8s.git
+cd free5gc-k8s
+
+# Namespace
+kubectl create namespace free5gc
+
+# MongoDB
+# editar mongodb/mongodb-deployment.yaml
+# image: docker.io/bitnamilegacy/mongodb:4.4.5
+
+kubectl apply -k mongodb -n free5gc
+
+# Networks
+kubectl apply -k networks5g -n free5gc
+
+# gtp5g
+cd bin
+./install-gtp5g.sh
+
+# Free5GC
+cd ..
+kubectl apply -k free5gc -n free5gc
+
+# verificar
+kubectl get pods -n free5gc
+
+# WebUI
+kubectl apply -k free5gc-webui -n free5gc
+
+# verificar
+kubectl get svc -n free5gc
+```
+
+Depois, para acessar:
+
+**Terminal 1 — N1:**
+
+```bash
+kubectl port-forward -n free5gc svc/webui-service 30505:5000
+```
+
+**Terminal 2 — notebook:**
+
+```bash
+ssh -L 30505:127.0.0.1:30505 \
+-i /home/mateuzu/FABRIC/fabric_config/keys/slice_key \
+-F /home/mateuzu/FABRIC/fabric_config/ssh_config \
+ubuntu@133.69.160.254
+```
+
+**Navegador:**
+
+```text
+http://localhost:30505
+```
+
+---
+
+## ⚠️ Três coisas que eu colocaria em destaque no README
+
+**1. Não usar a instalação antiga via Helm.**
+Nosso caminho reproduzível foi `testbed-automator` + `free5gc-k8s`.
+
+**2. Não avançar enquanto MongoDB/Kubernetes não estiverem saudáveis.**
+O projeto também orienta esperar o MongoDB estar `Running` antes dos próximos componentes. 
+
+**3. A imagem do MongoDB é uma adaptação necessária no nosso ambiente.**
+
+```yaml
+image: docker.io/bitnamilegacy/mongodb:4.4.5
+```
+
+Isso foi necessário porque a imagem original do manifesto não estava disponível. **Essa alteração é específica da reprodução que fizemos e deve ser registrada no README**, para que seu amigo não fique tentando descobrir por que recebe `ImagePullBackOff`.
+
+E, finalmente, o estado que alcançamos confirma que a parte **N1 + Kubernetes + MongoDB + Free5GC + WebUI** está funcionando: todos os componentes estavam `Running`, e o serviço `webui-service` estava exposto internamente na porta 5000/NodePort 30505. 
+
+Esse é um bom ponto para salvar o ambiente/README antes de começarmos N2/N3, porque daqui para frente já entramos na parte **UERANSIM → gNB → AMF → UE → UPF → tráfego 5G**.
